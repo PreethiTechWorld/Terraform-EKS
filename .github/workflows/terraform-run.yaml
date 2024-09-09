@@ -1,0 +1,162 @@
+name: "Terraform actions"
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+permissions:
+      id-token: write # This is required for aws oidc connection
+      contents: read # This is required for actions/checkout
+      pull-requests: write 
+env:
+  TF_LOG: INFO
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials from AWS account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.8.1
+
+      - name: Terraform fmt
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        env:
+          AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
+          AWS_BUCKET_KEY_NAME: ${{ secrets.AWS_BUCKET_KEY_NAME }}
+        run: |
+          terraform init -backend-config="bucket=${AWS_BUCKET_NAME}" -backend-config="key=${AWS_BUCKET_KEY_NAME}" -backend-config="region=${AWS_REGION}"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+          
+              BRANCH=$(echo "${{ github.head_ref }}" | sed 's|refs/heads/||')
+              if [[ "$BRANCH" == 'dev' || "$BRANCH" == 'stage' ]]; then
+                WORKSPACE_NAME="$BRANCH"
+              else
+                echo "Pull request not originating from dev or stage branch, cannot determine workspace."
+                exit 1
+              fi
+
+          elif [[ "${{ github.event_name }}" == 'push' ]]; then
+            # Extract the source branch name from the event
+            
+            LATESTLOG=$(git log -1 --pretty=%B)
+            SOURCE_BRANCH=$(echo $LATESTLOG | awk -F '\\\\n' '{print $1}' |  awk -F '/' '{print $2}' | awk '{print $1}')
+            if [[ "$SOURCE_BRANCH" == 'dev' ]]; then
+              WORKSPACE_NAME="$SOURCE_BRANCH"
+            elif [[ "$SOURCE_BRANCH" == 'stage' ]]; then
+              WORKSPACE_NAME="$SOURCE_BRANCH"
+            else
+              echo "Pull request not merged from dev branch to main, cannot determine workspace."
+              exit 1
+            fi
+          fi
+          
+          echo "WORKSPACE_NAME=$WORKSPACE_NAME" >> $GITHUB_ENV
+          terraform workspace select $WORKSPACE_NAME || terraform workspace new $WORKSPACE_NAME
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request' 
+        run: |
+
+          if [[ "${{ env.WORKSPACE_NAME }}" == 'dev' ]]; then
+            VAR_FILE='dev.tfvars'
+          elif [[ "${{ env.WORKSPACE_NAME }}" == 'stage' ]]; then
+            VAR_FILE='stage.tfvars'
+          else
+            exit 0
+          fi
+           
+          terraform plan -no-color --var-file="$VAR_FILE"
+        continue-on-error: true
+
+      - uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform Apply 
+        if: github.event_name == 'push'
+        run: |
+          
+          if [[ "${{ env.WORKSPACE_NAME }}" == 'dev' ]]; then
+            VAR_FILE='dev.tfvars'
+          elif [[ "${{ env.WORKSPACE_NAME }}" == 'stage' ]]; then
+            VAR_FILE='stage.tfvars'
+          else
+            exit 0
+          fi
+          terraform apply -auto-approve --var-file=$VAR_FILE
+          
+      - name: Terraform Destroy 
+        if: github.event_name == 'push' 
+        run: |
+          if [[ "${{ env.WORKSPACE_NAME }}" == 'dev' ]]; then
+            VAR_FILE='dev.tfvars'
+          elif [[ "${{ env.WORKSPACE_NAME }}" == 'stage' ]]; then
+            VAR_FILE='stage.tfvars'
+          else
+            exit 0
+          fi
+          terraform destroy -auto-approve --var-file=$VAR_FILE
+          
